@@ -2,8 +2,6 @@
   (:require [clojure.java.io :as io])
   (:gen-class))
 
-(def test-file "EXAMPLE_FILE.txt")
-
 (defn file-to-bytes
   "Takes a string that is a path to a file and
   returns the file as a vector of bytes."
@@ -72,8 +70,8 @@
              (get-bit-patterns (:left huffman-tree) (conj bit-path 0))
              (get-bit-patterns (:right huffman-tree) (conj bit-path 1))))))
 
-(defn -main []
-  (let [file-bytes (file-to-bytes test-file) ;; This will give us a vector of bytes.
+(defn -main [argv]
+  (let [file-bytes (file-to-bytes argv) ;; This will give us a vector of bytes.
         byte-counts (seq (frequencies file-bytes)) ;; This will give back a seq of [byte count], like this: ([97 1] [98 2] [99 4])
         leafs (map #(->Node nil nil (first %) (second %)) byte-counts)
         leafs-sorted (sort-by :count leafs)
