@@ -1,8 +1,10 @@
 # huffman-tree
-A small Huffman tree implementation in Clojure
+A Huffman tree compressor/decompressor implementation in Clojure
+Works on large files.
 
-It prints the original bits/bytes it received and the new compressed bits/bytes.
+How to run:
 
-Running it is simple, just do:
-
-lein run SOME_FILE
+lein run [-c or -d] input-file-name [optional -o] output-file-name
+-c, --compress FILE    File to compress
+-d, --decompress FILE  File to decompress
+-o, --output FILE      Output file
