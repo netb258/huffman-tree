@@ -1,5 +1,6 @@
 # huffman-tree
 A Huffman tree compressor/decompressor implementation in Clojure
+
 Works on large files.
 
 How to run:
