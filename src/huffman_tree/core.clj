@@ -18,8 +18,7 @@
 (mr/set-default-registry!
   (conj (m/default-schemas)
         {:Node [:fn #(instance? Node %)]}
-        {:java-byte [:fn #(instance? java.lang.Byte %)]
-         :io/InputStream [:fn #(instance? java.io.InputStream %)]}))
+        {:java-byte [:fn #(instance? java.lang.Byte %)]}))
 
 ;; NOTE: This is probably not the most efficient way to build the huffman tree, but it shouldn't matter much.
 ;; A huffman tree's leafs are made up of every unique byte in a file.
@@ -133,6 +132,33 @@
   (let [compressed-bytes (get-bit-patterns huffman-tree)] ;; Transform to: ({:byte 97, :bits [0 0]} {:byte 98, :bits [0 1]} ...)
     (reduce #(assoc %1 (:byte %2) (:bits %2)) {} compressed-bytes)))
 
+(defn bit-to-key
+  "Small helper function to convert bit values 0 and 1 into :left and :right keys."
+  {:malli/schema
+   [:=> [:cat int?] keyword?]}
+  [bit]
+  (cond
+    (= bit 0) :left
+    (= bit 1) :right
+    :else (throw (IllegalArgumentException. (str "Invalid bit: " bit)))))
+
+(defn code-table-to-huffman-tree
+  "Reverse function. Converts a code table back to a Huffman tree."
+  {:malli/schema
+   [:=> [:cat [:map-of :java-byte [:vector int?]]] :Node]}
+  [code-table]
+  (reduce
+    (fn [tree [byte-val bits-vector]]
+      ;; Convert bit sequence to path of keys: [0 1] -> [:left :right]
+      (let [path (map bit-to-key bits-vector)
+            ;; The :value keyword needs to be included: [:left :right :value]
+            ;; This way we can properly insert the byte.
+            path-with-value (conj (vec path) :value)]
+        (assoc-in tree path-with-value byte-val)))
+    ;; Start with an empty base Node.
+    (->Node nil nil nil nil)
+    code-table))
+
 ;; ---------------------------------------------------------------------------------------------
 ;; -------------------------------------- Bits and Bytes: --------------------------------------
 ;; ---------------------------------------------------------------------------------------------
@@ -184,24 +210,13 @@
   [the-byte]
   (mapv #(bit-and 1 (bit-shift-right the-byte %)) (range 7 -1 -1)))
 
-;; NOTE: Might not end up using this function. What would happen if the input file is huge?
-;; Probably this function would cause OutOfMemoryError. Need to do some testing.
-(defn bit-seq-to-byte-array
-  "Takes a seq of bits (0s and 1s) and packs them into a byte-array.
-  Example: [1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0] becomes (byte-array [-128 -128])"
-  {:malli/schema
-   [:=> [:cat [:sequential int?]] bytes?]}
-  [bits]
-  (let [bit-groups (partition-all 8 bits)] ;; Group bits by 8. May contain a single group below 8.
-    (byte-array (map bit-seq-to-byte bit-groups))))
-
 (defn byte-array-to-bit-seq
   "Takes a byte array and converts it to a seq of bits (0s and 1s).
   Example: (byte-array [-128 -128]) returns [1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0]"
   {:malli/schema
    [:=> [:cat bytes? number?] [:sequential int?]]}
   [byte-arr total-bit-count]
-  (let [all-bits (flatten (map byte-to-bit-seq byte-arr))]
+  (let [all-bits (mapcat byte-to-bit-seq byte-arr)]
     ;; Take only the number of bits we need.
     ;; We must leave out any trailing zeros that were added as padding to fit the 8-bit boundary
     (take total-bit-count all-bits)))
@@ -277,27 +292,53 @@
 ;; ----------------------------------- Decompress Functions: -----------------------------------
 ;; ---------------------------------------------------------------------------------------------
 
+;; NOTE: Initially used this function, but it was too slow.
+;; (defn decompress-bit-seq
+;;   "Converts a compressed seq of bits (0s and 1s) into an uncompressed lazy-seq of bytes."
+;;   {:malli/schema
+;;    [:function
+;;     [:=> [:cat [:sequential int?] [:map-of :java-byte [:vector int?]]]
+;;          [:sequential :java-byte]]
+;;     [:=> [:cat [:maybe [:sequential int?]] [:map-of [:vector int?] :java-byte] vector?]
+;;          [:sequential :java-byte]]]}
+;;   ;; Invert the table: converts {97 [0 0], 98 [0 1], 99 [1]} into {[0 0] 97, [0 1] 98, [1] 99}
+;;   ([compressed-bit-seq code-table] (decompress-bit-seq (seq compressed-bit-seq) (clojure.set/map-invert code-table) []))
+;;   ([compressed-bit-seq inverted-table current-pattern]
+;;    (lazy-seq
+;;      ;; We are using next for recursion, so if the seq is empty next will return nil.
+;;      (when compressed-bit-seq
+;;        (let [next-pattern (conj current-pattern (first compressed-bit-seq))
+;;              matching-byte (get inverted-table next-pattern)]
+;;          (if matching-byte
+;;            ;; If a match is found, record the byte and clear the accumulator pattern
+;;            (cons matching-byte (decompress-bit-seq (next compressed-bit-seq) inverted-table []))
+;;            ;; If no match yet, keep accumulating bits
+;;            (decompress-bit-seq (next compressed-bit-seq) inverted-table next-pattern)))))))
+
 (defn decompress-bit-seq
-  "Converts a compressed seq of bits (0s and 1s) into an uncompressed lazy-seq of bytes."
+  "Converts a compressed seq of bits (0s and 1s) into an uncompressed lazy-seq of bytes
+   by traversing down the Huffman tree."
   {:malli/schema
    [:function
-    [:=> [:cat [:sequential int?] [:map-of :java-byte [:vector int?]]]
+    [:=> [:cat [:sequential int?] :Node]
          [:sequential :java-byte]]
-    [:=> [:cat [:maybe [:sequential int?]] [:map-of [:vector int?] :java-byte] vector?]
+    [:=> [:cat [:sequential int?] :Node :Node]
          [:sequential :java-byte]]]}
-  ;; Invert the table: converts {97 [0 0], 98 [0 1], 99 [1]} into {[0 0] 97, [0 1] 98, [1] 99}
-  ([compressed-bit-seq code-table] (decompress-bit-seq (seq compressed-bit-seq) (clojure.set/map-invert code-table) []))
-  ([compressed-bit-seq inverted-table current-pattern]
+  ([compressed-bit-seq huffman-tree]
+   ;; Here we're passing compressed-bit-seq, huffman-tree, huffman-tree to start from the root of the tree.
+   (decompress-bit-seq compressed-bit-seq huffman-tree huffman-tree))
+  ([compressed-bit-seq huffman-tree current-node]
    (lazy-seq
-     ;; We are using next for recursion, so if the seq is empty next will return nil.
-     (when compressed-bit-seq
-       (let [next-pattern (conj current-pattern (first compressed-bit-seq))
-             matching-byte (get inverted-table next-pattern)]
-         (if matching-byte
-           ;; If a match is found, record the byte and clear the accumulator pattern
-           (cons matching-byte (decompress-bit-seq (next compressed-bit-seq) inverted-table []))
-           ;; If no match yet, keep accumulating bits
-           (decompress-bit-seq (next compressed-bit-seq) inverted-table next-pattern)))))))
+     (loop [remaining-bits compressed-bit-seq
+            node current-node]
+       (when (seq remaining-bits)
+         (let [bit (first remaining-bits)
+               next-node (if (= bit 0) (:left node) (:right node))]
+           (if (and (nil? (:left next-node)) (nil? (:right next-node)))
+             ;; Leaf reached: cons byte and lazily restart from the root with the 3-argument arity.
+             (cons (:value next-node) (decompress-bit-seq (rest remaining-bits) huffman-tree huffman-tree))
+             ;; Internal node reached: move deeper into the tree using tail-recursion.
+             (recur (rest remaining-bits) next-node))))))))
 
 (defn read-compressed-file
   "Reads the metadata and packed bytes from a compressed file and returns them in a map."
@@ -327,7 +368,7 @@
   (let [{:keys [code-table total-bit-count compressed-data]} (read-compressed-file file-path)
         bits (byte-array-to-bit-seq compressed-data total-bit-count)]
     (println "Decompressing file ...")
-    (decompress-bit-seq bits code-table)))
+    (decompress-bit-seq bits (code-table-to-huffman-tree code-table))))
 
 ;; ---------------------------------------------------------------------------------------------
 ;; ------------------------------------------- Main: -------------------------------------------
