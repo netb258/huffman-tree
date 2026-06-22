@@ -316,8 +316,7 @@
 ;;            (decompress-bit-seq (next compressed-bit-seq) inverted-table next-pattern)))))))
 
 (defn decompress-bit-seq
-  "Converts a compressed seq of bits (0s and 1s) into an uncompressed lazy-seq of bytes
-   by traversing down the Huffman tree."
+  "Converts a compressed seq of bits (0s and 1s) into an uncompressed lazy-seq of bytes by walking a Huffman tree."
   {:malli/schema
    [:function
     [:=> [:cat [:sequential int?] :Node]
