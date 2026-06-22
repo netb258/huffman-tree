@@ -94,7 +94,7 @@
             :count 3},
     :value nil,
     :count 7}
-  Example output: '({:byte 97, :bits [0 0]} {:byte 98, :bits [0 1]} {:byte 99, :bits [1]})
+  Example output: '({:byte 99, :bits [0]} {:byte 97, :bits [1 0]} {:byte 98, :bits [1 1]})
   Since the leafs with the highest :count are at the top of the tree,
   they receive the shortest bit patter (:bits) when walking the tree."
   {:malli/schema 
