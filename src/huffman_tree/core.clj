@@ -5,7 +5,6 @@
             [malli.dev.pretty :as pretty]
             [malli.instrument :as mi]
             [malli.registry :as mr])
-  (:import [java.nio.file Files Paths])
   (:gen-class))
 
 ;; ---------------------------------------------------------------------------------------------
@@ -18,7 +17,8 @@
 (mr/set-default-registry!
   (conj (m/default-schemas)
         {:Node [:fn #(instance? Node %)]}
-        {:java-byte [:fn #(instance? java.lang.Byte %)]}))
+        {:java-byte [:fn #(instance? java.lang.Byte %)]}
+        {:io/InputStream [:fn #(instance? java.io.InputStream %)]}))
 
 ;; NOTE: This is probably not the most efficient way to build the huffman tree, but it shouldn't matter much.
 ;; A huffman tree's leafs are made up of every unique byte in a file.
@@ -94,7 +94,7 @@
             :count 3},
     :value nil,
     :count 7}
-  Example output: '({:byte 99, :bits [0]} {:byte 97, :bits [1 0]} {:byte 98, :bits [1 1]})
+  Example output: '({:byte 97, :bits [0 0]} {:byte 98, :bits [0 1]} {:byte 99, :bits [1]})
   Since the leafs with the highest :count are at the top of the tree,
   they receive the shortest bit patter (:bits) when walking the tree."
   {:malli/schema 
@@ -163,17 +163,33 @@
 ;; -------------------------------------- Bits and Bytes: --------------------------------------
 ;; ---------------------------------------------------------------------------------------------
 
-;; Notice how each function here has a mirror?
-;; We need a function for compression a mirror function for decompression.
-
-(defn file-to-byte-array
-  "Uses the Java NIO library to efficiently read a file.
-  Takes the path to the file and returns a primitive java byte array.
-  Clojure has a wrapping mechanism to treat this array as a seq later on."
+(defn lazy-input-stream
+  "Reads an InputStream lazily into a sequence of bytes in efficient 4KB chunks, and closes the stream at the end."
   {:malli/schema
-   [:=> [:cat string?] bytes?]}
+   [:function
+    [:=> [:cat :io/InputStream] [:sequential :java-byte]]
+    [:=> [:cat :io/InputStream bytes?] [:sequential :java-byte]]]}
+  ;; Public arity: Called by the user.
+  ([^java.io.InputStream stream]
+   (lazy-input-stream stream (byte-array 4096)))
+  ;; Recursive arity: Handles the lazy sequencing and buffer management.
+  ([^java.io.InputStream stream ^bytes buffer]
+   (lazy-seq
+     (let [bytes-read (.read stream buffer)]
+       (if (= bytes-read -1)
+         (do (.close stream) nil) ;; End of file reached, close safely
+         (let [chunk (map unchecked-byte (take bytes-read buffer))]
+           ;; Important: We pass a NEW buffer to the next step
+           ;; to prevent mutation and data corruption in the lazy sequence.
+           (concat chunk (lazy-input-stream stream (byte-array 4096)))))))))
+
+(defn lazy-file-seq
+  "Opens an InputStream for the given file path and returns a lazy sequence of bytes.
+  Reads data from disk in efficient 4KB chunks and yields elements lazily."
+  {:malli/schema
+   [:=> [:cat string?] [:sequential :java-byte]]}
   [file-path]
-  (Files/readAllBytes (Paths/get file-path (into-array String []))))
+  (lazy-input-stream (io/input-stream file-path)))
 
 (defn write-byte-seq-to-file
   "Takes a lazy sequence of bytes and a string path, then 
@@ -190,10 +206,10 @@
         (let [ary (byte-array chunk)]
           (.write os ary))))))
 
-(defn bit-seq-to-byte
+(defn bit-seq->byte
   "Converts a seq of bits (0s and 1s) into a single byte.
   NOTE that the function expects a seq with 8 or less bits (0s and 1s).
-  For example (bit-seq-to-byte [1 0 0 0 0 0 0 0]) returns -128"
+  For example (bit-seq->byte [1 0 0 0 0 0 0 0]) returns -128"
   {:malli/schema
    [:=> [:cat [:sequential int?]] :java-byte]}
   [bit-seq]
@@ -203,25 +219,26 @@
     (unchecked-byte 
       (reduce (fn [byte-val bit] (+ (bit-shift-left byte-val 1) bit)) 0 padded-group))))
 
-(defn byte-to-bit-seq
+(defn byte->bit-seq
   "Converts a single byte into a vector of 8 bits (e.g., -128 would be [1 0 0 0 0 0 0 0])"
   {:malli/schema
    [:=> [:cat :java-byte] [:sequential int?]]}
   [the-byte]
   (mapv #(bit-and 1 (bit-shift-right the-byte %)) (range 7 -1 -1)))
 
-(defn byte-array-to-bit-seq
-  "Takes a byte array and converts it to a seq of bits (0s and 1s).
-  Example: (byte-array [-128 -128]) returns [1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0]"
+(defn byte-seq->bit-seq
+  "Takes a byte seq and converts it to a seq of bits (0s and 1s).
+  Example: (byte-seq '(-128 -128)) returns [1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0]"
   {:malli/schema
-   [:=> [:cat bytes? number?] [:sequential int?]]}
+   [:=> [:cat [:sequential :java-byte] number?] [:sequential int?]]}
   [byte-arr total-bit-count]
-  (let [all-bits (mapcat byte-to-bit-seq byte-arr)]
+  ;; Everything here is lazy. The mapcat is lazy and also the take is lazy.
+  (let [all-bits (mapcat byte->bit-seq byte-arr)]
     ;; Take only the number of bits we need.
     ;; We must leave out any trailing zeros that were added as padding to fit the 8-bit boundary
     (take total-bit-count all-bits)))
 
-(defn bits-to-megabytes
+(defn bits->megabytes
   "Takes the number of bits and returns the number of megabytes.
   Works with floating point numbers.
   NOTE: We are dividing by 8388608, because:
@@ -255,65 +272,43 @@
     ;; Stream the bits to disk using partition-all/doseq. This way we process a lazy seq's members one at a time.
     (let [bit-groups (partition-all 8 all-bits-seq)]
       (doseq [group bit-groups]
-        (.write oos (int (bit-seq-to-byte group)))))))
+        (.write oos (int (bit-seq->byte group)))))))
 
 (defn compress
-  "Main compressin function.
-  Takes a primitive byte array and saves a compressed version of the bytes to a file."
+  "Main compression function.
+  Streams a file twice to build a Huffman tree and save a compressed version with O(1) RAM."
   {:malli/schema
-   [:=> [:cat bytes? string?] nil?]}
-  [original-bytes output-file-path]
-  (let [byte-frequencies (seq (frequencies original-bytes)) ;; This will give back a seq of [byte count], like this: ([97 1] [98 2] [99 4])
-        ;; Build sorted leafs. Build tree. Make O(1) lookup table
+   [:=> [:cat string? string?] nil?]}
+  [input-file-path output-file-path]
+  ;; Pass 1: Compute frequencies with lazy-file-seq. The resulting map contains max 256 keys.
+  (println "Calculating byte frequencies ...")
+  (let [byte-frequencies (frequencies (lazy-file-seq input-file-path)) 
+        ;; Now that we have the byte frequencies, we can create the Huffman tree:
         leafs (map #(->Node nil nil (first %) (second %)) byte-frequencies)
         leafs-sorted (sort-by :count leafs)
         huffman-tree (build-tree leafs-sorted)
-        ;; Create a lookup table with original bytes and compressed bits: {97 [0 0], 98 [0 1], 99 [1]}
+        ;; Create a code table using the tree.
         code-table (make-code-table huffman-tree)
-        ;; Map the original bytes to compressed bit vectors (vectors with 0s and 1s)
-        ;; and flatten these vectors into a single seq of 0s and 1s. NOTE: Used to be flatten here, but mapcat is faster.
-        all-bits-seq (mapcat #(get code-table %) original-bytes)
-        ;; all-bits-seq (flatten (map #(get code-table %) original-bytes))
-        ;; NOTE: This used to be just (count all-bits-seq), but that did not work on large files.
-        ;; The issue is that the all-bits-seq can be very large. Now flatten and map return
-        ;; a lazy seq so that is not an issue, but count attempts to realize the whole thing.
-        ;; So now we need to calculate the bit count by using the code-table and the frequency count.
+        ;; Calculate the compressed output's bit count by using the code-table and the frequency count.
         total-bit-count (reduce-kv
                           (fn [total byte freq] 
                             (+ total (* freq (count (get code-table byte))))) 
                           0 
                           byte-frequencies)
-        output-data-mb (bits-to-megabytes total-bit-count)]
-    ;; If the output file is 2mb or bigger, tell the user we are working. Smaller files should be instantanious.
-    (when (>= output-data-mb 2.0) (println "The compressed file will be: " output-data-mb "MB in size."))
-    (save-compressed-file output-file-path code-table total-bit-count all-bits-seq)))
+        output-data-mb (bits->megabytes total-bit-count)]
+    (when (>= output-data-mb 2.0) 
+      (println "The compressed file will be: " output-data-mb "MB in size."))
+    ;; Pass 2: Open a fresh lazy stream and read the file all over again.
+    ;; This time we are using the code-table to map the original bytes into compressed bits.
+    ;; Every operation here is lazy.
+    ;; Reading the file is lazy, mapping the bytes with mapcat is lazy and saving the result is lazy.
+    (let [second-pass-bytes (lazy-file-seq input-file-path)
+          all-bits-seq (mapcat #(get code-table %) second-pass-bytes)]
+      (save-compressed-file output-file-path code-table total-bit-count all-bits-seq))))
 
 ;; ---------------------------------------------------------------------------------------------
 ;; ----------------------------------- Decompress Functions: -----------------------------------
 ;; ---------------------------------------------------------------------------------------------
-
-;; NOTE: Initially used this function, but it was too slow.
-;; (defn decompress-bit-seq
-;;   "Converts a compressed seq of bits (0s and 1s) into an uncompressed lazy-seq of bytes."
-;;   {:malli/schema
-;;    [:function
-;;     [:=> [:cat [:sequential int?] [:map-of :java-byte [:vector int?]]]
-;;          [:sequential :java-byte]]
-;;     [:=> [:cat [:maybe [:sequential int?]] [:map-of [:vector int?] :java-byte] vector?]
-;;          [:sequential :java-byte]]]}
-;;   ;; Invert the table: converts {97 [0 0], 98 [0 1], 99 [1]} into {[0 0] 97, [0 1] 98, [1] 99}
-;;   ([compressed-bit-seq code-table] (decompress-bit-seq (seq compressed-bit-seq) (clojure.set/map-invert code-table) []))
-;;   ([compressed-bit-seq inverted-table current-pattern]
-;;    (lazy-seq
-;;      ;; We are using next for recursion, so if the seq is empty next will return nil.
-;;      (when compressed-bit-seq
-;;        (let [next-pattern (conj current-pattern (first compressed-bit-seq))
-;;              matching-byte (get inverted-table next-pattern)]
-;;          (if matching-byte
-;;            ;; If a match is found, record the byte and clear the accumulator pattern
-;;            (cons matching-byte (decompress-bit-seq (next compressed-bit-seq) inverted-table []))
-;;            ;; If no match yet, keep accumulating bits
-;;            (decompress-bit-seq (next compressed-bit-seq) inverted-table next-pattern)))))))
 
 (defn decompress-bit-seq
   "Converts a compressed seq of bits (0s and 1s) into an uncompressed lazy-seq of bytes by walking a Huffman tree."
@@ -321,42 +316,37 @@
    [:function
     [:=> [:cat [:sequential int?] :Node]
          [:sequential :java-byte]]
-    [:=> [:cat [:sequential int?] :Node :Node]
+    [:=> [:cat [:sequential int?] :Node [:map [:left map?] [:right map?]]]
          [:sequential :java-byte]]]}
   ([compressed-bit-seq huffman-tree]
-   ;; Here we're passing compressed-bit-seq, huffman-tree, huffman-tree to start from the root of the tree.
    (decompress-bit-seq compressed-bit-seq huffman-tree huffman-tree))
   ([compressed-bit-seq huffman-tree current-node]
    (lazy-seq
-     (loop [remaining-bits compressed-bit-seq
-            node current-node]
-       (when (seq remaining-bits)
-         (let [bit (first remaining-bits)
-               next-node (if (= bit 0) (:left node) (:right node))]
-           (if (and (nil? (:left next-node)) (nil? (:right next-node)))
-             ;; Leaf reached: cons byte and lazily restart from the root with the 3-argument arity.
-             (cons (:value next-node) (decompress-bit-seq (rest remaining-bits) huffman-tree huffman-tree))
-             ;; Internal node reached: move deeper into the tree using tail-recursion.
-             (recur (rest remaining-bits) next-node))))))))
+    (when-let [bits (seq compressed-bit-seq)]
+      (let [bit (first bits)
+            next-node (if (= bit 0) (:left current-node) (:right current-node))]
+        (if (and (nil? (:left next-node)) (nil? (:right next-node)))
+          ;; Leaf reached: cons byte and lazily restart from the root with the 3-argument arity.
+          (cons (:value next-node) (decompress-bit-seq (rest bits) huffman-tree huffman-tree))
+          ;; Internal node reached: move deeper into the tree.
+          (decompress-bit-seq (rest bits) huffman-tree next-node)))))))
 
 (defn read-compressed-file
-  "Reads the metadata and packed bytes from a compressed file and returns them in a map."
+  "Reads the metadata and packed bytes safely from a compressed file."
   {:malli/schema
    [:=> [:cat string?]
-        [:map [:code-table [:map-of :java-byte [:vector int?]]]
-              [:total-bit-count number?]
-              [:compressed-data bytes?]]]}
+    [:map [:code-table [:map-of :java-byte [:vector int?]]]
+     [:total-bit-count number?]
+     [:compressed-data [:sequential :java-byte]]]]}
   [file-path]
-  (with-open [is (io/input-stream file-path)
-              ois (java.io.ObjectInputStream. is)
-              baos (java.io.ByteArrayOutputStream.)]
-    (let [code-table (.readObject ois)
-          total-bit-count (.readLong ois)]
-      ;; Stream all remaining bytes directly into the byte array output stream
-      (.transferTo ois baos)
-      {:code-table code-table
-       :total-bit-count total-bit-count
-       :compressed-data (.toByteArray baos)})))
+  (let [is (io/input-stream file-path)
+        ois (java.io.ObjectInputStream. is)
+        code-table (.readObject ois)
+        total-bit-count (.readLong ois)]
+    ;; Notice we are not closing the streams here, lazy-input-stream will do it.
+    {:code-table code-table
+     :total-bit-count total-bit-count
+     :compressed-data (lazy-input-stream ois)}))
 
 (defn decompress
   "Main decompression function.
@@ -365,7 +355,7 @@
    [:=> [:cat string?] [:sequential :java-byte]]}
   [file-path]
   (let [{:keys [code-table total-bit-count compressed-data]} (read-compressed-file file-path)
-        bits (byte-array-to-bit-seq compressed-data total-bit-count)]
+        bits (byte-seq->bit-seq compressed-data total-bit-count)]
     (println "Decompressing file ...")
     (decompress-bit-seq bits (code-table-to-huffman-tree code-table))))
 
@@ -392,7 +382,7 @@
         file-output (or (:output options) (first arguments))]
     (cond
       errors (println "Error:\n" (clojure.string/join "\n" errors))
-      (and file-compress file-output)   (compress (file-to-byte-array file-compress) file-output)
+      (and file-compress file-output)   (compress file-compress file-output)
       (and file-decompress file-output) (write-byte-seq-to-file (decompress file-decompress) file-output)
       :else (do (println "Usage: lein run [-c or -d] input-file [optional -o] output-file") 
                 (println summary)))))
