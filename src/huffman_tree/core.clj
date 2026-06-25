@@ -306,7 +306,7 @@
   {:malli/schema
    [:=> [:cat string? string?] nil?]}
   [input-file-path output-file-path]
-  ;; Pass 1: Compute frequencies with lazy-file-seq. The resulting map contains max 256 keys.
+  ;; Pass 1: Compute frequencies with count-byte-frequencies. The resulting map contains max 256 keys.
   ;; You could also just do (frequencies (lazy-file-seq input-file-path)), but it is not efficient.
   (println "Calculating byte frequencies ...")
   (let [byte-frequencies (count-byte-frequencies input-file-path) 
