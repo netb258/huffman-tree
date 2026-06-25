@@ -274,6 +274,32 @@
       (doseq [group bit-groups]
         (.write oos (int (bit-seq->byte group)))))))
 
+(defn count-byte-frequencies
+  "Computes the byte frequencies of a file efficiently using a primitive array loop.
+  Returns a map with every unique byte in the file as a keys and the number of times it appears in the file as values.
+  Ex: {97 1, 98 2, 99 4 ...}"
+  {:malli/schema
+   [:=> [:cat string?] [:map-of :java-byte int?]]}
+  [file-path]
+  (let [buffer (byte-array 8192) ;; 8KB buffer
+        freqs (int-array 256)]   ;; Holds the frequencies for 256 possible byte values
+    (with-open [stream (java.io.FileInputStream. file-path)]
+      (loop []
+        (let [bytes-read (.read stream buffer)]
+          (when-not (= bytes-read -1) ;; If we haven't reached EOF, then do the inner loop and recur.
+            ;; Inner loop over the primitive array chunk
+            (dotimes [i bytes-read]
+              (let [b (aget buffer i)
+                    ;; Convert signed byte (-128 to 127) to unsigned index (0 to 255)
+                    idx (bit-and b 0xFF)]
+                (aset freqs idx (inc (aget freqs idx)))))
+            (recur)))))
+    ;; Convert the primitive int-array to a Clojure map.
+    (into {} (for [i (range 256)
+                   :let [freq (aget freqs i)]
+                   :when (pos? freq)]
+               [(byte (if (> i 127) (- i 256) i)) freq]))))
+
 (defn compress
   "Main compression function.
   Streams a file twice to build a Huffman tree and save a compressed version with O(1) RAM."
@@ -281,8 +307,9 @@
    [:=> [:cat string? string?] nil?]}
   [input-file-path output-file-path]
   ;; Pass 1: Compute frequencies with lazy-file-seq. The resulting map contains max 256 keys.
+  ;; You could also just do (frequencies (lazy-file-seq input-file-path)), but it is not efficient.
   (println "Calculating byte frequencies ...")
-  (let [byte-frequencies (frequencies (lazy-file-seq input-file-path)) 
+  (let [byte-frequencies (count-byte-frequencies input-file-path) 
         ;; Now that we have the byte frequencies, we can create the Huffman tree:
         leafs (map #(->Node nil nil (first %) (second %)) byte-frequencies)
         leafs-sorted (sort-by :count leafs)
