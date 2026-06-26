@@ -302,7 +302,7 @@
 
 (defn compress
   "Main compression function.
-  Streams a file twice to build a Huffman tree and save a compressed version with O(1) RAM."
+  Reads a file twice to build a Huffman tree and save a compressed version with O(1) RAM usage."
   {:malli/schema
    [:=> [:cat string? string?] nil?]}
   [input-file-path output-file-path]
