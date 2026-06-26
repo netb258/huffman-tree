@@ -164,8 +164,7 @@
 ;; ---------------------------------------------------------------------------------------------
 
 (defn lazy-input-stream
-  "Reads an InputStream lazily into a sequence of bytes in efficient chunks,
-  and closes the stream at the end. Fully compatible with existing downstream consumers."
+  "Reads an InputStream lazily into a sequence of bytes in efficient 4KB chunks, and closes the stream at the end."
   {:malli/schema
    [:function
     [:=> [:cat :io/InputStream] [:sequential :java-byte]]
